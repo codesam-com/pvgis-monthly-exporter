@@ -4,11 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import sys
 from calendar import month_name
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pandas as pd
 import requests
@@ -41,8 +40,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download monthly PVGIS data and export CSV/JSON/XLSX."
     )
-    parser.add_argument("--latitude", required=True, type=float, help="Latitude in decimal degrees.")
-    parser.add_argument("--longitude", required=True, type=float, help="Longitude in decimal degrees.")
+    parser.add_argument(
+        "--latitude",
+        required=True,
+        type=float,
+        help="Latitude in decimal degrees.",
+    )
+    parser.add_argument(
+        "--longitude",
+        required=True,
+        type=float,
+        help="Longitude in decimal degrees.",
+    )
     return parser.parse_args()
 
 
@@ -54,10 +63,10 @@ def validate_coordinates(latitude: float, longitude: float) -> None:
 
 
 def build_output_slug(latitude: float, longitude: float) -> str:
-    def normalize(value: float, prefix_pos: str, prefix_neg: str) -> str:
-        prefix = prefix_pos if value >= 0 else prefix_neg
-        safe = f"{abs(value):.4f}".replace(".", "_")
-        return f"{prefix}{safe}"
+    def normalize(value: float, positive_prefix: str, negative_prefix: str) -> str:
+        prefix = positive_prefix if value >= 0 else negative_prefix
+        safe_value = f"{abs(value):.4f}".replace(".", "_")
+        return f"{prefix}{safe_value}"
 
     lat_slug = normalize(latitude, "lat", "latm")
     lon_slug = normalize(longitude, "lon", "lonm")
@@ -80,6 +89,7 @@ def request_pvgis_monthly_data(latitude: float, longitude: float) -> dict[str, A
     }
 
     response = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -94,66 +104,27 @@ def request_pvgis_monthly_data(latitude: float, longitude: float) -> dict[str, A
     return payload
 
 
-def iter_nested_values(node: Any) -> Iterable[Any]:
-    if isinstance(node, dict):
-        for value in node.values():
-            yield value
-            yield from iter_nested_values(value)
-    elif isinstance(node, list):
-        for item in node:
-            yield item
-            yield from iter_nested_values(item)
-
-
-def find_monthly_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates: list[list[dict[str, Any]]] = []
-
-    direct_paths = [
-        payload.get("outputs", {}).get("monthly"),
-        payload.get("outputs", {}).get("monthly_data"),
-        payload.get("monthly"),
-    ]
-
-    for candidate in direct_paths:
-        if isinstance(candidate, list) and all(isinstance(x, dict) for x in candidate):
-            candidates.append(candidate)
-
-    for value in iter_nested_values(payload):
-        if isinstance(value, list) and value and all(isinstance(x, dict) for x in value):
-            first = value[0]
-            if "month" in first or "Month" in first:
-                candidates.append(value)
-
-    if not candidates:
-        raise RuntimeError("Unable to locate monthly records in PVGIS JSON response.")
-
-    def score(records: list[dict[str, Any]]) -> tuple[int, int]:
-        first = records[0]
-        keys = set(first.keys())
-        expected = {"month", "Month", "H(h)_m", "Hb(n)_m", "H(i_opt)_m", "Kd", "T2m"}
-        return (len(keys & expected), len(records))
-
-    best = sorted(candidates, key=score, reverse=True)[0]
-    return best
-
-
 def first_number(value: Any) -> float | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if math.isnan(value):
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
             return None
         return float(value)
+
     if isinstance(value, str):
         text = value.strip().replace(",", ".")
-        if text == "":
+        if not text:
             return None
         try:
             return float(text)
         except ValueError:
-            match = re.search(r"-?\d+(?:\.\d+)?", text)
-            if match:
-                return float(match.group(0))
+            return None
+
     return None
 
 
@@ -164,40 +135,105 @@ def get_first_present(record: dict[str, Any], keys: list[str]) -> Any:
     return None
 
 
+def is_monthly_table(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 12:
+        return False
+
+    if not all(isinstance(item, dict) for item in value):
+        return False
+
+    months: list[int] = []
+    for row in value:
+        month_raw = row.get("month", row.get("Month"))
+        month_num = first_number(month_raw)
+        if month_num is None:
+            return False
+        months.append(int(month_num))
+
+    if sorted(months) != list(range(1, 13)):
+        return False
+
+    keys = set().union(*(row.keys() for row in value))
+    expected_keys = {"H(h)_m", "H(i_opt)_m", "Hb(n)_m", "Kd", "T2m"}
+
+    return len(keys & expected_keys) >= 3
+
+
+def walk_and_collect_monthly_tables(node: Any, candidates: list[list[dict[str, Any]]]) -> None:
+    if is_monthly_table(node):
+        candidates.append(node)
+        return
+
+    if isinstance(node, dict):
+        for child in node.values():
+            walk_and_collect_monthly_tables(child, candidates)
+    elif isinstance(node, list):
+        for child in node:
+            walk_and_collect_monthly_tables(child, candidates)
+
+
+def find_monthly_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[list[dict[str, Any]]] = []
+    walk_and_collect_monthly_tables(payload, candidates)
+
+    if not candidates:
+        debug_path = Path("debug_pvgis_response.json")
+        debug_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            "Unable to locate the 12-row monthly MRcalc table in PVGIS JSON response. "
+            f"Full response saved to {debug_path}."
+        )
+
+    def score(records: list[dict[str, Any]]) -> int:
+        keys = set().union(*(row.keys() for row in records))
+        expected = {"month", "Month", "H(h)_m", "H(i_opt)_m", "Hb(n)_m", "Kd", "T2m"}
+        return len(keys & expected)
+
+    return sorted(candidates, key=score, reverse=True)[0]
+
+
 def normalize_records(records: list[dict[str, Any]], latitude: float, longitude: float) -> pd.DataFrame:
     normalized_rows: list[dict[str, Any]] = []
 
     for record in records:
         month_value = get_first_present(record, ["month", "Month"])
-        month_number = int(first_number(month_value) or 0)
+        month_number_raw = first_number(month_value)
+        if month_number_raw is None:
+            continue
+
+        month_number = int(month_number_raw)
         if not 1 <= month_number <= 12:
             continue
 
-        row = {
-            "month_number": month_number,
-            "month_name": month_name[month_number],
-            "latitude": round(latitude, 6),
-            "longitude": round(longitude, 6),
-            "solar_radiation_database": RADIATION_DATABASE,
-            "start_year": START_YEAR,
-            "end_year": END_YEAR,
-            "global_horizontal_irradiation_kwh_m2_month": first_number(
-                get_first_present(record, ["H(h)_m", "Hh", "global_horizontal_irradiation"])
-            ),
-            "direct_normal_irradiation_kwh_m2_month": first_number(
-                get_first_present(record, ["Hb(n)_m", "DNI", "direct_normal_irradiation"])
-            ),
-            "global_irradiation_optimum_angle_kwh_m2_month": first_number(
-                get_first_present(record, ["H(i_opt)_m", "Hi_opt", "global_irradiation_optimum_angle"])
-            ),
-            "diffuse_to_global_ratio": first_number(
-                get_first_present(record, ["Kd", "d2g", "diffuse_to_global_ratio"])
-            ),
-            "average_temperature_c": first_number(
-                get_first_present(record, ["T2m", "temperature", "average_temperature"])
-            ),
-        }
-        normalized_rows.append(row)
+        normalized_rows.append(
+            {
+                "month_number": month_number,
+                "month_name": month_name[month_number],
+                "latitude": round(latitude, 6),
+                "longitude": round(longitude, 6),
+                "solar_radiation_database": RADIATION_DATABASE,
+                "start_year": START_YEAR,
+                "end_year": END_YEAR,
+                "global_horizontal_irradiation_kwh_m2_month": first_number(
+                    get_first_present(record, ["H(h)_m"])
+                ),
+                "direct_normal_irradiation_kwh_m2_month": first_number(
+                    get_first_present(record, ["Hb(n)_m"])
+                ),
+                "global_irradiation_optimum_angle_kwh_m2_month": first_number(
+                    get_first_present(record, ["H(i_opt)_m"])
+                ),
+                "diffuse_to_global_ratio": first_number(
+                    get_first_present(record, ["Kd"])
+                ),
+                "average_temperature_c": first_number(
+                    get_first_present(record, ["T2m"])
+                ),
+            }
+        )
 
     if len(normalized_rows) != 12:
         raise RuntimeError(
@@ -205,7 +241,14 @@ def normalize_records(records: list[dict[str, Any]], latitude: float, longitude:
         )
 
     df = pd.DataFrame(normalized_rows)
-    df = df.sort_values("month_number").reset_index(drop=True)
+    df = df.sort_values("month_number").drop_duplicates(subset=["month_number"], keep="first")
+    df = df.reset_index(drop=True)
+
+    if len(df) != 12:
+        raise RuntimeError(
+            f"Expected 12 unique months after deduplication, got {len(df)}."
+        )
+
     df = df[OUTPUT_COLUMNS]
 
     float_columns = [
@@ -234,12 +277,16 @@ def write_csv(df: pd.DataFrame, destination: Path) -> None:
 
 def write_json(df: pd.DataFrame, destination: Path) -> None:
     records = df.to_dict(orient="records")
-    destination.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    destination.write_text(
+        json.dumps(records, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def write_xlsx(df: pd.DataFrame, destination: Path) -> None:
     with pd.ExcelWriter(destination, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="monthly_data")
+
         workbook = writer.book
         worksheet = writer.sheets["monthly_data"]
 
@@ -251,16 +298,14 @@ def write_xlsx(df: pd.DataFrame, destination: Path) -> None:
             cell.font = header_font
 
         for idx, column_name in enumerate(df.columns, start=1):
-            max_len = max(
-                len(str(column_name)),
-                *(len(str(value)) for value in df.iloc[:, idx - 1].tolist())
-            )
+            values = df.iloc[:, idx - 1].tolist()
+            max_len = max(len(str(column_name)), *(len(str(value)) for value in values))
             worksheet.column_dimensions[get_column_letter(idx)].width = min(max_len + 2, 40)
 
         workbook.save(destination)
 
 
-def write_latest_manifest(output_dir: Path, csv_path: Path, json_path: Path, xlsx_path: Path) -> None:
+def write_manifest(output_dir: Path, csv_path: Path, json_path: Path, xlsx_path: Path) -> None:
     manifest = {
         "files": {
             "csv": csv_path.name,
@@ -279,6 +324,7 @@ def main() -> int:
 
     try:
         validate_coordinates(args.latitude, args.longitude)
+
         payload = request_pvgis_monthly_data(args.latitude, args.longitude)
         monthly_records = find_monthly_records(payload)
         df = normalize_records(monthly_records, args.latitude, args.longitude)
@@ -293,7 +339,7 @@ def main() -> int:
         write_csv(df, csv_path)
         write_json(df, json_path)
         write_xlsx(df, xlsx_path)
-        write_latest_manifest(output_dir, csv_path, json_path, xlsx_path)
+        write_manifest(output_dir, csv_path, json_path, xlsx_path)
 
         print(f"Generated files in: {output_dir}")
         print(f" - {csv_path.name}")
