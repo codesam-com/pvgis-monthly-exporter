@@ -1,6 +1,6 @@
 # PVGIS Monthly Exporter
 
-Repositorio para generar y versionar exportaciones mensuales de PVGIS a partir de una latitud y una longitud.
+Repositorio para generar exportaciones mensuales de PVGIS a partir de una latitud y una longitud.
 
 ## Qué hace
 
@@ -30,7 +30,7 @@ Además, cada fila incluye:
 - `start_year`
 - `end_year`
 
-## Estructura de salida
+## Estructura de salida local
 
 Los archivos generados se guardan en:
 
